@@ -27,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import cv2
@@ -1459,47 +1460,41 @@ def draw(bgr, roll_box, dets, title: str):
     return out
 
 
-def run_ocr(
-    image_path: Path,
+def run_ocr_on_frame(
+    bgr: np.ndarray,
+    frame_label: str,
     output_dir: Path,
-    master_path: Path,
+    master: list[dict],
+    reader: "PPOCRReader",
     min_det_conf: float = 0.2,
-    gpu: bool = False,
-    backend: str = "auto",
-) -> dict:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix: str = "",
+) -> dict | None:
+    """
+    Run the full ply_no/start-end pipeline on a single already-decoded BGR frame.
+
+    Unlike run_ocr(), this takes a live frame (from a video/camera stream or a
+    still image already read by the caller) plus a pre-built, pre-warmed
+    `reader` and `master` list so it can be called once per frame without
+    reloading OCR models or the master CSV every time.
+
+    Returns None (after printing a message) when no sheet roll is found in
+    the frame — the expected outcome for most frames of a live stream — so
+    callers can just skip that frame instead of treating it as fatal.
+    """
     crops_dir = output_dir / "crops"
-    crops_dir.mkdir(exist_ok=True)
-
-    bgr = cv2.imread(str(image_path))
-    if bgr is None:
-        raise FileNotFoundError(image_path)
+    crops_dir.mkdir(parents=True, exist_ok=True)
     h, w = bgr.shape[:2]
-
-    master = load_master_list(master_path)
-    print(f"Master list: {master_path} ({len(master)} rows)")
 
     roll_mask, roll_box = detect_sheet_roll_mask(bgr)
     if roll_box is None:
-        raise RuntimeError("Sheet roll not found")
+        print(f"  [{frame_label}] sheet roll not found — skipping")
+        return None
     write_bgr, write_box = handwriting_roi_inside_roll(bgr, roll_mask, roll_box)
     wx1, wy1, _, _ = write_box
 
-    cv2.imwrite(str(output_dir / "01_roll_mask.png"), roll_mask)
-    cv2.imwrite(str(output_dir / "02_roll_only.png"), mask_outside_roll(bgr, roll_mask))
-    cv2.imwrite(str(output_dir / "03_writing_crop.png"), write_bgr)
-
-    model_dir = output_dir.parent / "ppocr_models"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    reader = PPOCRReader(
-        backend=backend,
-        device="gpu" if gpu else "cpu",
-        lang="en",
-        model_dir=model_dir,
-        verbose=True,
-    )
-    print(f"Loading PaddleOCR ({reader.backend})...")
-    reader.warmup()
+    cv2.imwrite(str(output_dir / f"{prefix}01_roll_mask.png"), roll_mask)
+    cv2.imwrite(str(output_dir / f"{prefix}02_roll_only.png"), mask_outside_roll(bgr, roll_mask))
+    cv2.imwrite(str(output_dir / f"{prefix}03_writing_crop.png"), write_bgr)
 
     # Dual detect: word-level (split start/end) + slightly merged (recover hyphens)
     print("Detecting (word-level + merge passes)...")
@@ -1552,8 +1547,8 @@ def run_ocr(
         crop = bgr[y1:y2, x1:x2].copy()
         if crop.size == 0:
             continue
-        prefix = f"crop_{i:02d}"
-        cv2.imwrite(str(crops_dir / f"{prefix}_raw.jpg"), crop)
+        crop_prefix = f"{prefix}crop_{i:02d}"
+        cv2.imwrite(str(crops_dir / f"{crop_prefix}_raw.jpg"), crop)
 
         if meta.get("synthetic"):
             best = {
@@ -1566,7 +1561,7 @@ def run_ocr(
             print(f"\n  [crop {i} synthetic/{meta.get('from')}] text='{meta['det_text']}'")
         else:
             for mode in ("mild", "medium"):
-                cv2.imwrite(str(crops_dir / f"{prefix}_{mode}.jpg"), preprocess_variant(crop, mode))
+                cv2.imwrite(str(crops_dir / f"{crop_prefix}_{mode}.jpg"), preprocess_variant(crop, mode))
             variants = read_all_variants(reader, crop)
             best = pick_best_reading(variants, meta["det_text"], meta["det_conf"])
             print(f"\n  [crop {i}] det='{meta['det_text']}'")
@@ -1719,33 +1714,223 @@ def run_ocr(
 
     title = f"ply={final['ply_no_final']} | {final['start_end_final']} | {action}"
     annotated = draw(bgr, roll_box, draw_dets, title)
-    ann_path = output_dir / "06_annotated.jpg"
+    ann_path = output_dir / f"{prefix}06_annotated.jpg"
     cv2.imwrite(str(ann_path), annotated)
-    cv2.imwrite(str(output_dir / "04_annotated.jpg"), annotated)
+    cv2.imwrite(str(output_dir / f"{prefix}04_annotated.jpg"), annotated)
 
     summary = {
-        "image": str(image_path),
-        "master_list": str(master_path),
+        "source": frame_label,
         "roll_box": list(roll_box),
         "crops": crop_results,
         "assembled": assembled,
         "final": final,
         "annotated": str(ann_path),
     }
-    json_path = output_dir / "ocr_result.json"
+    json_path = output_dir / f"{prefix}ocr_result.json"
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Wrote {ann_path}")
     print(f"Wrote {json_path}")
     return summary
 
 
+def run_ocr(
+    image_path: Path,
+    output_dir: Path,
+    master_path: Path,
+    min_det_conf: float = 0.2,
+    gpu: bool = False,
+    backend: str = "auto",
+) -> dict:
+    """Run OCR on a single still image file (original CLI entry point)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    bgr = cv2.imread(str(image_path))
+    if bgr is None:
+        raise FileNotFoundError(image_path)
+
+    master = load_master_list(master_path)
+    print(f"Master list: {master_path} ({len(master)} rows)")
+
+    model_dir = output_dir.parent / "ppocr_models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    reader = PPOCRReader(
+        backend=backend,
+        device="gpu" if gpu else "cpu",
+        lang="en",
+        model_dir=model_dir,
+        verbose=True,
+    )
+    print(f"Loading PaddleOCR ({reader.backend})...")
+    reader.warmup()
+
+    summary = run_ocr_on_frame(bgr, str(image_path), output_dir, master, reader, min_det_conf)
+    if summary is None:
+        raise RuntimeError("Sheet roll not found")
+    summary["master_list"] = str(master_path)
+    return summary
+
+
+def _quit_key_pressed() -> bool:
+    """
+    Non-blocking check for a 'q' pressed at the terminal, for stopping a
+    --video run that has no --show window to catch cv2.waitKey('q') on.
+
+    Windows: msvcrt.kbhit()/getch() sees the key the instant it's pressed.
+    POSIX: falls back to select() on stdin, which (in the terminal's default
+    cooked mode) only sees the line once Enter is pressed too — i.e. type
+    'q' then Enter. Never blocks; returns False on any platform/console
+    where neither works (e.g. stdin isn't a real console).
+    """
+    try:
+        import msvcrt
+
+        if msvcrt.kbhit():
+            return msvcrt.getch() in (b"q", b"Q")
+        return False
+    except ImportError:
+        pass
+
+    try:
+        import select
+
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.readline().strip().lower() == "q"
+    except Exception:  # noqa: BLE001 - stdin may not be a pollable console at all
+        pass
+    return False
+
+
+def run_ocr_video(
+    video_source: str,
+    output_dir: Path,
+    master_path: Path,
+    min_det_conf: float = 0.2,
+    gpu: bool = False,
+    backend: str = "auto",
+    frame_stride: int = 5,
+    max_frames: int = 0,
+    stop_on_auto: bool = False,
+    show: bool = False,
+) -> list[dict]:
+    """
+    Run the same ply_no/start-end OCR pipeline over a video stream instead of
+    a single image.
+
+    `video_source` is passed straight to cv2.VideoCapture, so it can be:
+      - a webcam/capture index, e.g. "0", "1"
+      - a video file path, e.g. "clip.mp4"
+      - a network stream URL, e.g. "rtsp://..." or "http://..."
+
+    Only frames that actually contain a detected sheet roll produce output
+    (annotated jpg + json) — most frames of a live feed won't, and those are
+    skipped silently rather than treated as errors. Every processed frame's
+    result is also appended to `ocr_stream_log.jsonl` in `output_dir` for a
+    running record of the whole session.
+
+    `--frame-stride` controls how often a frame is actually OCR'd (OCR is far
+    slower than frame capture), `--max-frames` caps how many roll-bearing
+    frames get processed, and `--stop-on-auto` ends the stream as soon as one
+    frame yields a confident ("auto") ply reading — useful for a scan-one-
+    roll-then-stop station instead of a continuously running monitor.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    master = load_master_list(master_path)
+    print(f"Master list: {master_path} ({len(master)} rows)")
+
+    cap_source = int(video_source) if str(video_source).isdigit() else str(video_source)
+    cap = cv2.VideoCapture(cap_source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {video_source!r}")
+
+    model_dir = output_dir.parent / "ppocr_models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    reader = PPOCRReader(
+        backend=backend,
+        device="gpu" if gpu else "cpu",
+        lang="en",
+        model_dir=model_dir,
+        verbose=True,
+    )
+    print(f"Loading PaddleOCR ({reader.backend})...")
+    reader.warmup()
+    print("Press 'q' (then Enter, if no --show window) or Ctrl+C to stop.")
+
+    log_path = output_dir / "ocr_stream_log.jsonl"
+    results: list[dict] = []
+    frame_idx = 0
+    processed = 0
+    try:
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                print("End of stream (or camera read failed).")
+                break
+
+            if frame_idx % max(1, frame_stride) == 0:
+                label = f"frame_{frame_idx:06d}"
+                print(f"\n--- {label} ---")
+                try:
+                    summary = run_ocr_on_frame(
+                        bgr, label, output_dir, master, reader, min_det_conf, prefix=f"{label}_"
+                    )
+                except Exception as err:  # noqa: BLE001 - one bad frame shouldn't kill the stream
+                    print(f"  [{label}] error: {err}")
+                    summary = None
+
+                if summary is not None:
+                    summary["master_list"] = str(master_path)
+                    results.append(summary)
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(summary) + "\n")
+                    processed += 1
+
+                quit_requested = False
+                if show:
+                    preview = cv2.imread(summary["annotated"]) if summary is not None else bgr
+                    cv2.imshow("ocr_using_paddleocr", preview)
+                    quit_requested = (cv2.waitKey(1) & 0xFF) == ord("q")
+                else:
+                    quit_requested = _quit_key_pressed()
+                if quit_requested:
+                    print("Stopped by user ('q').")
+                    break
+
+                if stop_on_auto and summary is not None and summary["final"]["operator_action"] == "auto":
+                    print("Confident reading found — stopping stream (--stop-on-auto).")
+                    break
+                if max_frames and processed >= max_frames:
+                    print(f"Reached --max-frames={max_frames}; stopping.")
+                    break
+
+            frame_idx += 1
+    finally:
+        cap.release()
+        if show:
+            cv2.destroyAllWindows()
+
+    print(f"\nProcessed {processed} roll-bearing frame(s) out of {frame_idx} read.")
+    print(f"Stream log: {log_path}")
+    return results
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     p = argparse.ArgumentParser(description="PaddleOCR writing-station OCR (pattern: ply_no + start-end)")
-    p.add_argument(
+    source = p.add_mutually_exclusive_group()
+    source.add_argument(
         "--image",
         type=Path,
-        default=root / "data" / r"C:\Users\Tanvi\Documents\Controlone\images\img7.jpeg",
+        default=None,
+        help="Run OCR once on a single still image (default input mode).",
+    )
+    source.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="Run OCR continuously on a video stream instead of a still image. "
+             "Accepts a webcam index ('0'), a video file path, or a network "
+             "stream URL (rtsp://..., http://...).",
     )
     p.add_argument("--output-dir", type=Path, default=root / "output" / "single_roll_ocr")
     p.add_argument("--master-list", type=Path, default=root / "data" / "master_list.csv")
@@ -1758,15 +1943,58 @@ def main():
         help="OCR backend. 'rapidocr' (ONNX Runtime) is the one that installs "
              "cleanly on a Raspberry Pi 5; 'paddle' needs a paddlepaddle build.",
     )
-    args = p.parse_args()
-    run_ocr(
-        args.image,
-        args.output_dir,
-        args.master_list,
-        args.min_det_conf,
-        args.gpu,
-        args.backend,
+    p.add_argument(
+        "--frame-stride",
+        type=int,
+        default=5,
+        help="[--video only] OCR every Nth captured frame (OCR is much slower "
+             "than frame capture). Default: 5.",
     )
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="[--video only] Stop after this many roll-bearing frames have "
+             "been OCR'd. 0 (default) means no limit.",
+    )
+    p.add_argument(
+        "--stop-on-auto",
+        action="store_true",
+        help="[--video only] Stop the stream as soon as one frame yields a "
+             "confident ('auto') ply reading, instead of running until end of "
+             "stream / --max-frames.",
+    )
+    p.add_argument(
+        "--show",
+        action="store_true",
+        help="[--video only] Display the live annotated stream in a window "
+             "(press 'q' to quit). Requires a GUI-capable OpenCV build.",
+    )
+    args = p.parse_args()
+
+    if args.video is not None:
+        run_ocr_video(
+            args.video,
+            args.output_dir,
+            args.master_list,
+            args.min_det_conf,
+            args.gpu,
+            args.backend,
+            args.frame_stride,
+            args.max_frames,
+            args.stop_on_auto,
+            args.show,
+        )
+    else:
+        image = args.image or root / "data" / r"C:\Users\Tanvi\Documents\Controlone\images\img7.jpeg"
+        run_ocr(
+            image,
+            args.output_dir,
+            args.master_list,
+            args.min_det_conf,
+            args.gpu,
+            args.backend,
+        )
 
 
 if __name__ == "__main__":
