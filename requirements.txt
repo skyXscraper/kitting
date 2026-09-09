@@ -1,0 +1,7 @@
+opencv-python==5.0.0.93
+numpy==2.4.6
+# OCR backend: rapidocr (ONNX Runtime) — recommended, installs cleanly on
+# Raspberry Pi 5 (aarch64). Selected automatically by --backend auto/rapidocr.
+rapidocr==3.9.2
+onnxruntime==1.29.0
+
