@@ -1800,6 +1800,29 @@ def _quit_key_pressed() -> bool:
     return False
 
 
+def _open_video_capture(video_source: str) -> cv2.VideoCapture:
+    """
+    Open a webcam index, /dev/videoN path, video file, or network stream URL.
+
+    For a webcam index or /dev/videoN path on Linux, this forces the V4L2
+    backend and requests MJPG explicitly. The default "let OpenCV guess"
+    path frequently fails to open USB cameras that work fine in ffplay/vlc:
+    OpenCV either doesn't pick V4L2 at all, or picks it but requests the
+    raw YUYV format, which many USB webcams don't support at their default
+    resolution — so the open (or the very first read) just silently fails.
+    """
+    source_str = str(video_source)
+    is_device = source_str.isdigit() or source_str.startswith("/dev/video")
+    cap_source = int(source_str) if source_str.isdigit() else source_str
+
+    if is_device and sys.platform.startswith("linux"):
+        cap = cv2.VideoCapture(cap_source, cv2.CAP_V4L2)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        return cap
+    return cv2.VideoCapture(cap_source)
+
+
 def run_ocr_video(
     video_source: str,
     output_dir: Path,
@@ -1838,10 +1861,14 @@ def run_ocr_video(
     master = load_master_list(master_path)
     print(f"Master list: {master_path} ({len(master)} rows)")
 
-    cap_source = int(video_source) if str(video_source).isdigit() else str(video_source)
-    cap = cv2.VideoCapture(cap_source)
+    cap = _open_video_capture(video_source)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video source: {video_source!r}")
+        raise RuntimeError(
+            f"Could not open video source: {video_source!r}. If this is a USB "
+            "camera, confirm the device node with `v4l2-ctl --list-devices` "
+            "and that it plays with `ffplay <device>`."
+        )
+    print(f"Opened video source {video_source!r} (backend={cap.getBackendName()})")
 
     model_dir = output_dir.parent / "ppocr_models"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -1864,7 +1891,15 @@ def run_ocr_video(
         while True:
             ok, bgr = cap.read()
             if not ok:
-                print("End of stream (or camera read failed).")
+                if frame_idx == 0:
+                    print(
+                        "Source opened but the very first frame read failed — "
+                        "usually a resolution/pixel-format the camera doesn't "
+                        "support. Check supported modes with "
+                        "`v4l2-ctl -d <device> --list-formats-ext`."
+                    )
+                else:
+                    print("End of stream (or camera read failed).")
                 break
 
             if frame_idx % max(1, frame_stride) == 0:
@@ -1986,7 +2021,7 @@ def main():
             args.show,
         )
     else:
-        image = args.image or root / "data" / r"C:\Users\Tanvi\Documents\Controlone\images\img7.jpeg"
+        image = args.image or root.parent / "images" / "img7.jpeg"
         run_ocr(
             image,
             args.output_dir,
