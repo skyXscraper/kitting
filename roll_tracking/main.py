@@ -74,6 +74,21 @@ import ocr_using_paddleocr as ocrp  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+def apply_frame_crop(frame: np.ndarray, crop: str) -> np.ndarray:
+    """
+    Take one lens of a dual-lens camera.
+
+    A stereo USB camera presents both lenses as a single double-wide frame
+    (3840x1080 is two 1920x1080 views side by side), which is why the ffplay
+    equivalent needs `-vf crop=iw/2:ih:0:0`. Left undone, every roll appears
+    twice in the frame and the tracker opens a second track for the copy.
+    """
+    if crop == "none":
+        return frame
+    half = frame.shape[1] // 2
+    return frame[:, :half] if crop == "left" else frame[:, half:]
+
+
 def detect_rolls_motion(bg_subtractor, bgr: np.ndarray, min_area_frac: float) -> list[tuple[int, int, int, int]]:
     """
     Generic moving-blob detector via MOG2 background subtraction. Works for
@@ -461,13 +476,20 @@ def camera_worker(
     writer_holder: dict,
     args: argparse.Namespace,
 ) -> None:
-    cap = ocrp._open_video_capture(source)
+    cap = ocrp._open_video_capture(
+        source, width=args.width, height=args.height, fps=args.fps, fourcc=args.fourcc
+    )
     if not cap.isOpened():
         print(f"[{name}] could not open video source {source!r}. "
               "If this is a USB camera, check `v4l2-ctl --list-devices` and `ffplay <device>`.")
         stop_event.set()
         return
-    print(f"[{name}] opened {source!r} (backend={cap.getBackendName()})")
+    print(f"[{name}] opened {source!r} (backend={cap.getBackendName()}, "
+          f"mode={ocrp.describe_capture_mode(cap)})")
+    if args.width or args.height or args.fourcc or args.fps:
+        print(f"[{name}] requested {args.width or '-'}x{args.height or '-'}"
+              f"@{args.fps or '-'}fps {args.fourcc or 'MJPG'} -- cameras negotiate, "
+              "so compare that against the mode above.")
 
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=32, detectShadows=True)
     detector_state = {"bg_subtractor": bg_subtractor}
@@ -492,6 +514,7 @@ def camera_worker(
             if not ok:
                 print(f"[{name}] end of stream / read failure.")
                 break
+            frame = apply_frame_crop(frame, args.crop)
             h, w = frame.shape[:2]
             if frame_diag is None:
                 frame_diag = math.hypot(w, h)
@@ -674,6 +697,16 @@ def main() -> None:
              "walls, ceilings and desks); hybrid=all three, de-duplicated.",
     )
     p.add_argument("--backend", choices=("auto", "paddle", "rapidocr"), default="auto")
+    p.add_argument("--width", type=int, default=None, help="Requested capture width, e.g. 3840.")
+    p.add_argument("--height", type=int, default=None, help="Requested capture height, e.g. 1080.")
+    p.add_argument("--fps", type=float, default=None, help="Requested capture frame rate, e.g. 30.")
+    p.add_argument("--fourcc", type=str, default=None,
+                    help="Requested pixel format as a 4-character V4L2 code, e.g. YUYV or MJPG. "
+                         "Defaults to MJPG, which most USB cameras need for their higher modes.")
+    p.add_argument("--crop", choices=("none", "left", "right"), default="none",
+                    help="Take one lens of a dual-lens camera. A stereo USB camera sends both "
+                         "lenses as one double-wide frame (3840x1080 = two 1920x1080 views), and "
+                         "without cropping every roll is detected twice.")
     p.add_argument("--gpu", action="store_true")
     p.add_argument("--master-list", type=Path, default=PROJECT_ROOT / "data" / "data" / "master_list.csv")
     p.add_argument("--min-area-frac", type=float, default=0.004, help="Min blob area as a fraction of frame area.")

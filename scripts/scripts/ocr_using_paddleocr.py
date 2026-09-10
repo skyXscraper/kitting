@@ -33,6 +33,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# This script's progress output contains arrows and other non-ASCII characters,
+# and a Windows console defaults to cp1252, which cannot encode them -- a bare
+# print() then raises UnicodeEncodeError mid-run. When this module is driven by
+# roll_tracking, that exception surfaced as "OCR found nothing" rather than as
+# an encoding problem. Degrade unprintable characters instead of raising.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 DIGIT_ALLOWLIST = "0123456789.- "
 CONFUSION_PAIRS = (("4", "9"), ("9", "4"), ("7", "9"), ("9", "7"))
@@ -222,7 +233,22 @@ def sanitize(text: str) -> str:
     t = t.replace("O", "0").replace("o", "0").replace("Q", "9").replace("q", "9")
     t = t.replace("—", "-").replace("–", "-").replace("_", "-")
     t = re.sub(r"[^\d.\- ]", "", t)
-    return re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    # Drop separators left dangling at either end. The recogniser routinely
+    # returns "4.7." or ".17.5" or "47-" for handwritten marker, and every
+    # downstream classifier here matches on exact patterns like \d+\.\d+, so
+    # a single stray dot was enough to throw the whole fragment away and
+    # leave the range unassembled.
+    t = t.lstrip("- ").rstrip(".- ")
+    if t.startswith("."):
+        rest = t[1:]
+        # ".17.5" is a decimal that lost its leading digit, so "17.5" is the
+        # right reading. ".12" is a decimal that lost its point instead --
+        # dropping the dot there would turn a bottom-line fragment into a
+        # plausible ply number and hand it the top line's job, so leave it
+        # malformed and let the classifiers reject it.
+        t = rest if "." in rest else t
+    return t
 
 
 def load_master_list(path: Path) -> list[dict]:
@@ -1006,7 +1032,10 @@ def apply_confusion_master_check(
     soft_range_ok = False
 
     if not best["range_ok"] and len(hits) > 1:
-        dists = sorted((best_dist(h), h) for h in hits)
+        # Sort on the distance alone: when two candidates tie, tuple comparison
+        # would fall through to comparing the hit dicts themselves and raise
+        # TypeError, which took down the whole OCR call.
+        dists = sorted(((best_dist(h), h) for h in hits), key=lambda pair: pair[0])
         # Require clear winner (next at least 2m worse) to auto-accept ply remap without exact range
         if dists[0][0] >= 1e8 or (len(dists) > 1 and dists[1][0] - dists[0][0] < 2.0):
             return {
@@ -1800,16 +1829,33 @@ def _quit_key_pressed() -> bool:
     return False
 
 
-def _open_video_capture(video_source: str) -> cv2.VideoCapture:
+def _open_video_capture(
+    video_source: str,
+    width: int | None = None,
+    height: int | None = None,
+    fps: float | None = None,
+    fourcc: str | None = None,
+) -> cv2.VideoCapture:
     """
     Open a webcam index, /dev/videoN path, video file, or network stream URL.
 
     For a webcam index or /dev/videoN path on Linux, this forces the V4L2
-    backend and requests MJPG explicitly. The default "let OpenCV guess"
-    path frequently fails to open USB cameras that work fine in ffplay/vlc:
-    OpenCV either doesn't pick V4L2 at all, or picks it but requests the
-    raw YUYV format, which many USB webcams don't support at their default
-    resolution — so the open (or the very first read) just silently fails.
+    backend. The default "let OpenCV guess" path frequently fails to open USB
+    cameras that work fine in ffplay/vlc: OpenCV either doesn't pick V4L2 at
+    all, or picks it but requests a format the camera doesn't support at its
+    default resolution — so the open (or the very first read) silently fails.
+
+    `width`/`height`/`fps`/`fourcc` request a specific capture mode, the same
+    way `ffplay -input_format yuyv422 -video_size 3840x1080 -framerate 30`
+    does; a camera only offers certain combinations, and asking for a
+    resolution without the matching pixel format is a common way to get a
+    much lower frame rate than the sensor can actually do. When no fourcc is
+    given, MJPG is requested, which is what most USB cameras need in order to
+    deliver their higher resolutions at full rate.
+
+    The camera negotiates: it may quietly hand back a different mode than the
+    one requested, so callers should report what was actually applied rather
+    than assume.
     """
     source_str = str(video_source)
     is_device = source_str.isdigit() or source_str.startswith("/dev/video")
@@ -1817,10 +1863,32 @@ def _open_video_capture(video_source: str) -> cv2.VideoCapture:
 
     if is_device and sys.platform.startswith("linux"):
         cap = cv2.VideoCapture(cap_source, cv2.CAP_V4L2)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    else:
+        cap = cv2.VideoCapture(cap_source)
+    if not cap.isOpened():
         return cap
-    return cv2.VideoCapture(cap_source)
+
+    if is_device:
+        # Pixel format first: V4L2 picks the resolution list from the format,
+        # so setting size before format can silently pin a lower mode.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*(fourcc or "MJPG")))
+    if width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    if height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+    if fps:
+        cap.set(cv2.CAP_PROP_FPS, float(fps))
+    return cap
+
+
+def describe_capture_mode(cap: cv2.VideoCapture) -> str:
+    """The mode the camera actually settled on, for reporting back."""
+    code = int(cap.get(cv2.CAP_PROP_FOURCC))
+    name = "".join(chr((code >> (8 * i)) & 0xFF) for i in range(4)).strip() if code else "?"
+    return (
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+        f"@{cap.get(cv2.CAP_PROP_FPS):.0f}fps {name}"
+    )
 
 
 def run_ocr_video(
