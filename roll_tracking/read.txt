@@ -1,0 +1,6 @@
+command to run :
+cd ~/kitting
+git pull
+source venv/bin/activate          # whatever your venv path is there
+cd roll_tracking
+python tracking_and_ocr.py --camera1 /dev/video0 --camera2 /dev/video1 --backend rapidocr --record
